@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fluid</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="view"></canvas>
+  <canvas id="overlay"></canvas>
+
+  <aside id="panel">
+    <header>
+      <span class="title">fluid</span>
+      <button id="toggle-panel" title="Hide panel (H)">–</button>
+    </header>
+    <div class="body">
+      <div class="group">
+        <div class="group-label">tool</div>
+        <div class="tools" id="tools"></div>
+        <p class="hint" id="hint"></p>
+      </div>
+      <div id="controls"></div>
+      <div class="group">
+        <div class="group-label">edges</div>
+        <div class="seg" id="edges">
+          <button data-v="open" class="on" title="Edges at ambient pressure (W)">open</button>
+          <button data-v="walls" title="Closed box (W)">walls</button>
+        </div>
+      </div>
+      <div class="group actions">
+        <button id="pause" title="Space">pause</button>
+        <button id="reset" title="R">reset fluid</button>
+        <button id="clear" title="Remove all zones and windows (C)">clear all</button>
+        <button id="invert" title="I">invert</button>
+      </div>
+      <p class="keys">1–7 tools · w walls · space pause · [ ] radius · h hide</p>
+    </div>
+  </aside>
+
+  <div id="stats"></div>
+
+  <script src="sim.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
