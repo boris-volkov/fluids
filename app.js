@@ -292,21 +292,9 @@
   // leave by being carried off an open edge, and enter with fluid flowing
   // in from outside.
   function stepParticles(dt) {
-    const { u, v, w, nx, ny } = sim;
+    const { nx, ny } = sim;
     const xmax = nx + 0.5, ymax = ny + 0.5;
     const walls = state.walls;
-
-    // Bilinear velocity lookup, written into su / sv.
-    let su = 0, sv = 0;
-    const sample = (x, y) => {
-      if (x < 0.5) x = 0.5; else if (x > xmax) x = xmax;
-      if (y < 0.5) y = 0.5; else if (y > ymax) y = ymax;
-      const i0 = x | 0, j0 = y | 0;
-      const s1 = x - i0, t1 = y - j0, s0 = 1 - s1, t0 = 1 - t1;
-      const k = i0 + w * j0;
-      su = s0 * (t0 * u[k] + t1 * u[k + w]) + s1 * (t0 * u[k + 1] + t1 * u[k + 1 + w]);
-      sv = s0 * (t0 * v[k] + t1 * v[k + w]) + s1 * (t0 * v[k + 1] + t1 * v[k + 1 + w]);
-    };
 
     // Whether a particle that crossed the boundary at (x, y) left through an
     // open window.
@@ -322,8 +310,9 @@
     while (i < count * 4) {
       let x = P[i], y = P[i + 1];
       // Midpoint (RK2) integration through the velocity field.
-      sample(x, y);
-      sample(x + half * su, y + half * sv);
+      sim.sample(x, y);
+      sim.sample(x + half * sim.su, y + half * sim.sv);
+      const su = sim.su, sv = sim.sv;
       x += dt * su;
       y += dt * sv;
 
@@ -350,7 +339,7 @@
   // speed x dt x density particles, placed within the strip that just
   // flowed in.
   function seedInflow(dt) {
-    const { u, v, w, nx, ny, openTop, openBottom, openLeft, openRight } = sim;
+    const { nx, ny, openTop, openBottom, openLeft, openRight } = sim;
     const walls = state.walls;
     if (walls && !sim.hasWindows) return;
     const density = (params.count * cs * cs) / (W * H); // particles per cell
@@ -364,12 +353,12 @@
       }
     };
     for (let c = 1; c <= nx; c++) {
-      spawn(v[c + w], (i, a, d) => { P[i] = c - 0.5 + a; P[i + 1] = 0.5 + d; }, openTop[c]);
-      spawn(-v[c + w * ny], (i, a, d) => { P[i] = c - 0.5 + a; P[i + 1] = ny + 0.5 - d; }, openBottom[c]);
+      spawn(sim.inflow('top', c), (i, a, d) => { P[i] = c - 0.5 + a; P[i + 1] = 0.5 + d; }, openTop[c]);
+      spawn(sim.inflow('bottom', c), (i, a, d) => { P[i] = c - 0.5 + a; P[i + 1] = ny + 0.5 - d; }, openBottom[c]);
     }
     for (let r = 1; r <= ny; r++) {
-      spawn(u[1 + w * r], (i, a, d) => { P[i] = 0.5 + d; P[i + 1] = r - 0.5 + a; }, openLeft[r]);
-      spawn(-u[nx + w * r], (i, a, d) => { P[i] = nx + 0.5 - d; P[i + 1] = r - 0.5 + a; }, openRight[r]);
+      spawn(sim.inflow('left', r), (i, a, d) => { P[i] = 0.5 + d; P[i + 1] = r - 0.5 + a; }, openLeft[r]);
+      spawn(sim.inflow('right', r), (i, a, d) => { P[i] = nx + 0.5 - d; P[i + 1] = r - 0.5 + a; }, openRight[r]);
     }
   }
 
@@ -656,7 +645,7 @@
       statsAt = now;
       statsEl.textContent =
         `${Math.round(fps)} fps · sim ${simMs.toFixed(1)} ms · ${count.toLocaleString('en-US')} particles · ` +
-        `${sim.nx}×${sim.ny} grid` + (state.paused ? ' · paused' : '');
+        `${sim.nx}×${sim.ny} grid · pressure ${sim.pressure.iters} it` + (state.paused ? ' · paused' : '');
     }
     requestAnimationFrame(frame);
   }

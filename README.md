@@ -20,7 +20,9 @@ Viscosity runs from inviscid to treacle, and the swirl slider keeps small eddies
 
 ## How it works
 
-`sim.js` is Jos Stam's stable-fluids solver (1999) on a uniform grid: forces, implicit viscous diffusion, semi-Lagrangian advection, then a pressure projection that keeps the velocity field divergence-free. On top of it go fans, vorticity confinement, and a weak compressibility, where a carried density field lets squeezed fluid expand again and stretched fluid contract.
+`sim.js` is Jos Stam's stable-fluids solver (1999): forces, implicit viscous diffusion, semi-Lagrangian advection, then a pressure projection that keeps the velocity field divergence-free. On top of it go fans, vorticity confinement, and a weak compressibility, where a carried density field lets squeezed fluid expand again and stretched fluid contract.
+
+The grid is staggered (a MAC grid): pressure sits at the centre of each cell and each velocity component on the faces between cells, so a cell's divergence is exactly what flows through its four faces. The pressure is solved to a tolerance every step, by conjugate gradients preconditioned with a multigrid V-cycle (McAdams et al., 2010), warm-started from the step before. The fluid that comes out the other side carries no more into a cell than out of it, to within 0.005 cells per second, and the effect of opening a window reaches the far wall in the same step instead of creeping across the room a few cells at a time.
 
 `app.js` moves the particles through that velocity field with a midpoint (RK2) step and draws them as instanced quads in WebGL2, stretched into streaks along their velocity if you ask for it. Browsers without WebGL2 fall back to a 2D canvas.
 

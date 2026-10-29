@@ -1,9 +1,22 @@
 'use strict';
 
 /*
- * Stable-fluids solver (Stam, 1999) on a uniform grid with one ghost cell on
- * every side. Grid units throughout: cell (i, j) has its centre at (i, j),
- * velocities are in cells per second.
+ * Stable-fluids solver (Stam, 1999) on a staggered (MAC) grid with one ghost
+ * cell on every side. Grid units throughout: cell (i, j) has its centre at
+ * (i, j), velocities are in cells per second.
+ *
+ * Pressure and density live at cell centres. Velocities live on the faces
+ * between cells: u[i + w * j] is the flow through the face at (i + 0.5, j),
+ * between cells i and i + 1, and v[i + w * j] through the face at
+ * (i, j + 0.5). So u[w * j] and u[nx + w * j] are the left and right edges
+ * of the domain, v[i] and v[i + w * ny] the top and bottom. Row 0 and row
+ * ny + 1 of u, and column 0 and column nx + 1 of v, are ghosts that hold the
+ * velocity along the edges.
+ *
+ * With velocities on faces, the divergence of a cell is exactly what flows
+ * through its four faces, and the pressure solve is converged every step
+ * (multigrid-preconditioned conjugate gradients), so the flow the particles
+ * ride on carries no more fluid into a cell than out of it.
  *
  * Extras on top of the classic solver:
  *  - fans: a disc of fluid driven towards a set velocity, the way a fan
@@ -68,14 +81,67 @@ class FluidSim {
     this.visc = 0;
     this.vorticity = 1;
     this.maxSpeed = 50;
-    this.pressureIters = 24;
     this.viscIters = 12;
+    this.pressure = new PressureSolver(nx, ny);
+    this.su = 0; this.sv = 0; // result of sample()
     this.updateBoundaryKinds(0);
   }
 
   reset() {
     for (const f of [this.u, this.v, this.u0, this.v0, this.p, this.div, this.curl]) f.fill(0);
     this.rho.fill(1);
+  }
+
+  // ---------------------------------------------------------------- sampling
+
+  // Bilinear lookups at a point (x, y) inside the domain, one per kind of
+  // grid location: faces of u, faces of v, cell centres.
+  sampleU(f, x, y) {
+    const { nx, w } = this;
+    x -= 0.5;
+    let i0 = x | 0;
+    if (i0 > nx - 1) i0 = nx - 1;
+    const j0 = y | 0;
+    const s1 = x - i0, t1 = y - j0, s0 = 1 - s1, t0 = 1 - t1;
+    const k = i0 + w * j0;
+    return s0 * (t0 * f[k] + t1 * f[k + w]) + s1 * (t0 * f[k + 1] + t1 * f[k + 1 + w]);
+  }
+
+  sampleV(f, x, y) {
+    const { ny, w } = this;
+    y -= 0.5;
+    let j0 = y | 0;
+    if (j0 > ny - 1) j0 = ny - 1;
+    const i0 = x | 0;
+    const s1 = x - i0, t1 = y - j0, s0 = 1 - s1, t0 = 1 - t1;
+    const k = i0 + w * j0;
+    return s0 * (t0 * f[k] + t1 * f[k + w]) + s1 * (t0 * f[k + 1] + t1 * f[k + 1 + w]);
+  }
+
+  sampleC(f, x, y) {
+    const w = this.w;
+    const i0 = x | 0, j0 = y | 0;
+    const s1 = x - i0, t1 = y - j0, s0 = 1 - s1, t0 = 1 - t1;
+    const k = i0 + w * j0;
+    return s0 * (t0 * f[k] + t1 * f[k + w]) + s1 * (t0 * f[k + 1] + t1 * f[k + 1 + w]);
+  }
+
+  // Velocity at (x, y), clamped into the domain, written into su / sv.
+  sample(x, y) {
+    const xmax = this.nx + 0.5, ymax = this.ny + 0.5;
+    if (x < 0.5) x = 0.5; else if (x > xmax) x = xmax;
+    if (y < 0.5) y = 0.5; else if (y > ymax) y = ymax;
+    this.su = this.sampleU(this.u, x, y);
+    this.sv = this.sampleV(this.v, x, y);
+  }
+
+  // How fast fluid flows into the domain through boundary cell i of a side.
+  inflow(side, i) {
+    const { nx, ny, w, u, v } = this;
+    if (side === 'top') return v[i];
+    if (side === 'bottom') return -v[i + w * ny];
+    if (side === 'left') return u[w * i];
+    return -u[nx + w * i];
   }
 
   // ---------------------------------------------------------------- boundaries
@@ -151,88 +217,86 @@ class FluidSim {
     }
   }
 
-  // Inlets hold the wind velocity. Outlets pass outflow through freely but
-  // don't copy inflow (copying backflow is a classic runaway); air can
-  // still be drawn in there by the pressure. Outside air streaming past an
-  // outlet drags its tangential component along with the wind. Walls: the
-  // normal component is mirrored (no flow through the wall), the tangential
-  // one slips freely.
-  velocityBoundary() {
+  // Flow through the edges of the domain. Walls let nothing through, inlets
+  // hold the wind velocity. At outlets this is only a first guess for the
+  // projection, which settles the real outflow: outflow from the next face
+  // in passes through, inflow isn't copied (copying backflow is a classic
+  // runaway), and air can still be drawn in there by the pressure.
+  normalBoundary() {
+    const { nx, ny, w, u, v, kindTop, kindBottom, kindLeft, kindRight, windU: wu, windV: wv } = this;
+    for (let i = 1; i <= nx; i++) {
+      const t = i, b = i + w * ny;
+      const kt = kindTop[i], kb = kindBottom[i];
+      v[t] = kt === WALL ? 0 : kt === INLET ? wv : Math.min(v[t + w], 0);
+      v[b] = kb === WALL ? 0 : kb === INLET ? wv : Math.max(v[b - w], 0);
+    }
+    for (let j = 1; j <= ny; j++) {
+      const l = w * j, r = l + nx;
+      const kl = kindLeft[j], kr = kindRight[j];
+      u[l] = kl === WALL ? 0 : kl === INLET ? wu : Math.min(u[l + 1], 0);
+      u[r] = kr === WALL ? 0 : kr === INLET ? wu : Math.max(u[r - 1], 0);
+    }
+  }
+
+  // Flow along the edges, in the ghost row / column just outside. Walls
+  // slip freely, inlets hold the wind, and outside air streaming past an
+  // outlet drags its tangential component along with the wind.
+  tangentialBoundary() {
     const { nx, ny, w, u, v, kindTop, kindBottom, kindLeft, kindRight, windU: wu, windV: wv } = this;
     const windy = wu !== 0 || wv !== 0;
     const last = w * (ny + 1);
-    for (let i = 1; i <= nx; i++) {
-      const t = i, b = last + i;
-      const kt = kindTop[i], kb = kindBottom[i];
-      if (kt === WALL) { u[t] = u[t + w]; v[t] = -v[t + w]; }
-      else if (kt === INLET) { u[t] = wu; v[t] = wv; }
-      else { u[t] = windy ? wu : u[t + w]; v[t] = Math.min(v[t + w], 0); }
-      if (kb === WALL) { u[b] = u[b - w]; v[b] = -v[b - w]; }
-      else if (kb === INLET) { u[b] = wu; v[b] = wv; }
-      else { u[b] = windy ? wu : u[b - w]; v[b] = Math.max(v[b - w], 0); }
+    for (let i = 0; i <= nx; i++) {
+      const c = i < 1 ? 1 : i;
+      const kt = kindTop[c], kb = kindBottom[c];
+      u[i] = kt === INLET || (kt === OUTLET && windy) ? wu : u[i + w];
+      u[last + i] = kb === INLET || (kb === OUTLET && windy) ? wu : u[last + i - w];
     }
-    for (let j = 1; j <= ny; j++) {
-      const l = w * j, r = l + nx + 1;
-      const kl = kindLeft[j], kr = kindRight[j];
-      if (kl === WALL) { u[l] = -u[l + 1]; v[l] = v[l + 1]; }
-      else if (kl === INLET) { u[l] = wu; v[l] = wv; }
-      else { u[l] = Math.min(u[l + 1], 0); v[l] = windy ? wv : v[l + 1]; }
-      if (kr === WALL) { u[r] = -u[r - 1]; v[r] = v[r - 1]; }
-      else if (kr === INLET) { u[r] = wu; v[r] = wv; }
-      else { u[r] = Math.max(u[r - 1], 0); v[r] = windy ? wv : v[r - 1]; }
+    for (let j = 0; j <= ny; j++) {
+      const c = j < 1 ? 1 : j, l = w * j, r = l + nx + 1;
+      const kl = kindLeft[c], kr = kindRight[c];
+      v[l] = kl === INLET || (kl === OUTLET && windy) ? wv : v[l + 1];
+      v[r] = kr === INLET || (kr === OUTLET && windy) ? wv : v[r - 1];
     }
-    this.corners(u);
-    this.corners(v);
+  }
+
+  velocityBoundary() {
+    this.normalBoundary();
+    this.tangentialBoundary();
   }
 
   // Turbulent shear at openings: the outside wind streaming past an opening
-  // drags the air just inside it along. The first two cells inside each
-  // outlet relax their along-the-wall velocity towards the wind's.
+  // drags the air just inside it along. The first two rows of faces inside
+  // each outlet relax their along-the-wall velocity towards the wind's.
   applyWindShear(dt) {
     const { nx, ny, w, u, v, kindTop, kindBottom, kindLeft, kindRight, windU: wu, windV: wv } = this;
     if (wu === 0 && wv === 0) return;
     const f1 = 1 - Math.exp(-this.shear * dt), f2 = 0.5 * f1;
-    for (let i = 1; i <= nx; i++) {
-      if (kindTop[i] === OUTLET) {
+    // A face along an edge is at an outlet if either cell beside it is.
+    const out = (kind, i) => kind[i] === OUTLET || kind[i + 1] === OUTLET;
+    for (let i = 1; i < nx; i++) {
+      if (out(kindTop, i)) {
         const k = i + w;
         u[k] += (wu - u[k]) * f1;
         u[k + w] += (wu - u[k + w]) * f2;
       }
-      if (kindBottom[i] === OUTLET) {
+      if (out(kindBottom, i)) {
         const k = i + w * ny;
         u[k] += (wu - u[k]) * f1;
         u[k - w] += (wu - u[k - w]) * f2;
       }
     }
-    for (let j = 1; j <= ny; j++) {
-      if (kindLeft[j] === OUTLET) {
+    for (let j = 1; j < ny; j++) {
+      if (out(kindLeft, j)) {
         const k = 1 + w * j;
         v[k] += (wv - v[k]) * f1;
         v[k + 1] += (wv - v[k + 1]) * f2;
       }
-      if (kindRight[j] === OUTLET) {
+      if (out(kindRight, j)) {
         const k = nx + w * j;
         v[k] += (wv - v[k]) * f1;
         v[k - 1] += (wv - v[k - 1]) * f2;
       }
     }
-  }
-
-  // Pressure: ambient (0) at outlets, zero-gradient at walls and at wind
-  // inlets (where the velocity is prescribed instead).
-  pressureBoundary(p) {
-    const { nx, ny, w, kindTop, kindBottom, kindLeft, kindRight } = this;
-    const last = w * (ny + 1);
-    for (let i = 1; i <= nx; i++) {
-      p[i] = kindTop[i] === OUTLET ? 0 : p[i + w];
-      p[last + i] = kindBottom[i] === OUTLET ? 0 : p[last + i - w];
-    }
-    for (let j = 1; j <= ny; j++) {
-      const r = w * j;
-      p[r] = kindLeft[j] === OUTLET ? 0 : p[r + 1];
-      p[r + nx + 1] = kindRight[j] === OUTLET ? 0 : p[r + nx];
-    }
-    this.corners(p);
   }
 
   // Open boundary cells hold the ambient value; walls are zero-gradient
@@ -285,58 +349,73 @@ class FluidSim {
     }
   }
 
-  // Nudges the velocity under a soft circular brush towards (vx, vy).
+  // Nudges the velocity under a soft circular brush towards (vx, vy). Each
+  // face is weighted by its own distance from the centre.
   splatVelocity(cx, cy, r, vx, vy, strength) {
     const { nx, ny, w, u, v } = this;
     const r2 = r * r;
-    const i0 = Math.max(1, Math.floor(cx - r)), i1 = Math.min(nx, Math.ceil(cx + r));
-    const j0 = Math.max(1, Math.floor(cy - r)), j1 = Math.min(ny, Math.ceil(cy + r));
-    for (let j = j0; j <= j1; j++) {
-      for (let i = i0; i <= i1; i++) {
-        const dx = i - cx, dy = j - cy, d2 = dx * dx + dy * dy;
-        if (d2 > r2) continue;
-        const k = i + w * j;
-        const f = strength * Math.exp(-3 * d2 / r2);
-        u[k] += (vx - u[k]) * f;
-        v[k] += (vy - v[k]) * f;
+    const brush = (f, target, ox, oy, imin, imax, jmin, jmax) => {
+      const i0 = Math.max(imin, Math.floor(cx - ox - r)), i1 = Math.min(imax, Math.ceil(cx - ox + r));
+      const j0 = Math.max(jmin, Math.floor(cy - oy - r)), j1 = Math.min(jmax, Math.ceil(cy - oy + r));
+      for (let j = j0; j <= j1; j++) {
+        for (let i = i0; i <= i1; i++) {
+          const dx = i + ox - cx, dy = j + oy - cy, d2 = dx * dx + dy * dy;
+          if (d2 > r2) continue;
+          const k = i + w * j;
+          f[k] += (target - f[k]) * strength * Math.exp(-3 * d2 / r2);
+        }
       }
-    }
+    };
+    brush(u, vx, 0.5, 0, 1, nx - 1, 1, ny);
+    brush(v, vy, 0, 0.5, 1, nx, 1, ny - 1);
   }
 
   // ------------------------------------------------------------------ solver
 
   addForces(dt) {
-    const { nx, ny, w, u, v, curl } = this;
+    const { nx, ny, w, u, v, u0: fx, v0: fy, curl } = this;
 
     // Vorticity confinement: push along N x omega, where N points towards
     // stronger swirl. Only swirl above a small threshold is reinforced, so
     // faint leftover eddies die out instead of being pumped up forever.
+    // Worked out at cell centres, then shared out to the faces either side.
     const eps = this.vorticity * dt;
     const floor = 0.5;
-    if (eps > 0) {
-      for (let j = 1; j <= ny; j++) {
-        for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
-          curl[k] = 0.5 * ((v[k + 1] - v[k - 1]) - (u[k + w] - u[k - w]));
-        }
+    if (eps <= 0) return;
+    for (let j = 1; j <= ny; j++) {
+      for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
+        // Centre velocities of the cells left / right and above / below.
+        const vr = v[k + 1] + v[k + 1 - w], vl = v[k - 1] + v[k - 1 - w];
+        const ud = u[k + w] + u[k + w - 1], uu = u[k - w] + u[k - w - 1];
+        curl[k] = 0.25 * ((vr - vl) - (ud - uu));
       }
-      for (let j = 2; j < ny; j++) {
-        for (let i = 2, k = 2 + w * j; i < nx; i++, k++) {
-          const cr = curl[k + 1], cl = curl[k - 1], cd = curl[k + w], cu = curl[k - w];
-          const gx = (cr < 0 ? -cr : cr) - (cl < 0 ? -cl : cl);
-          const gy = (cd < 0 ? -cd : cd) - (cu < 0 ? -cu : cu);
-          const len2 = gx * gx + gy * gy;
-          const ck = curl[k];
-          const strong = ck > floor ? ck - floor : ck < -floor ? ck + floor : 0;
-          if (strong === 0 || len2 < 1e-8) continue;
-          const c = strong * eps / Math.sqrt(len2);
-          u[k] += gy * c;
-          v[k] -= gx * c;
-        }
+    }
+    fx.fill(0);
+    fy.fill(0);
+    for (let j = 2; j < ny; j++) {
+      for (let i = 2, k = 2 + w * j; i < nx; i++, k++) {
+        const cr = curl[k + 1], cl = curl[k - 1], cd = curl[k + w], cu = curl[k - w];
+        const gx = (cr < 0 ? -cr : cr) - (cl < 0 ? -cl : cl);
+        const gy = (cd < 0 ? -cd : cd) - (cu < 0 ? -cu : cu);
+        const len2 = gx * gx + gy * gy;
+        const ck = curl[k];
+        const strong = ck > floor ? ck - floor : ck < -floor ? ck + floor : 0;
+        if (strong === 0 || len2 < 1e-8) continue;
+        const c = strong * eps / Math.sqrt(len2);
+        fx[k] = gy * c;
+        fy[k] = -gx * c;
+      }
+    }
+    for (let j = 1; j <= ny; j++) {
+      for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
+        if (i < nx) u[k] += 0.5 * (fx[k] + fx[k + 1]);
+        if (j < ny) v[k] += 0.5 * (fy[k] + fy[k + w]);
       }
     }
   }
 
-  // Implicit viscous diffusion, solved with Gauss-Seidel.
+  // Implicit viscous diffusion, solved with Gauss-Seidel, on the inner
+  // faces; the edges stay as the boundary sets them.
   diffuseVelocity(dt) {
     const a = dt * this.visc;
     if (a <= 0) return;
@@ -347,18 +426,18 @@ class FluidSim {
     for (let it = 0; it < this.viscIters; it++) {
       for (let j = 1; j <= ny; j++) {
         for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
-          u[k] = (u0[k] + a * (u[k - 1] + u[k + 1] + u[k - w] + u[k + w])) * c;
-          v[k] = (v0[k] + a * (v[k - 1] + v[k + 1] + v[k - w] + v[k + w])) * c;
+          if (i < nx) u[k] = (u0[k] + a * (u[k - 1] + u[k + 1] + u[k - w] + u[k + w])) * c;
+          if (j < ny) v[k] = (v0[k] + a * (v[k - 1] + v[k + 1] + v[k - w] + v[k + w])) * c;
         }
       }
-      this.velocityBoundary();
+      this.tangentialBoundary();
     }
   }
 
-  // Sets the divergence of the velocity to stiffness * (rho - 1) + zones:
+  // Sets the divergence of every cell to stiffness * (rho - 1) + zones:
   // squeezed fluid expands, stretched fluid contracts, and zones push the
-  // balance one way or the other. SOR with the previous pressure as a warm
-  // start, so a few iterations per frame are enough.
+  // balance one way or the other. The pressure that does it is solved to a
+  // tolerance every step, warm-started from the last one.
   project() {
     const { nx, ny, w, u, v, p, div, rho, source } = this;
     const kappa = this.stiffness;
@@ -373,57 +452,62 @@ class FluidSim {
       }
       offset = sum / (nx * ny);
     }
+    // Right-hand side: target divergence minus the current one.
     for (let j = 1; j <= ny; j++) {
       for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
-        div[k] = -0.5 * (u[k + 1] - u[k - 1] + v[k + w] - v[k - w]) + kappa * (rho[k] - 1) + source[k] - offset;
+        div[k] = kappa * (rho[k] - 1) + source[k] - offset - (u[k] - u[k - 1] + v[k] - v[k - w]);
       }
     }
-    this.pressureBoundary(p);
 
-    const omega = 1.75;
-    for (let it = 0; it < this.pressureIters; it++) {
-      for (let j = 1; j <= ny; j++) {
-        for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
-          p[k] += omega * ((div[k] + p[k - 1] + p[k + 1] + p[k - w] + p[k + w]) * 0.25 - p[k]);
-        }
-      }
-      this.pressureBoundary(p);
-    }
+    this.pressure.setBoundary(this.kindTop, this.kindBottom, this.kindLeft, this.kindRight);
+    this.pressure.solve(p, div);
 
-    // Subtract the pressure gradient, and cap the speed so nothing can run
-    // away.
-    const max2 = this.maxSpeed * this.maxSpeed;
+    // Subtract the pressure gradient on every face between two cells, and
+    // on the outlet edges, where the pressure outside is ambient (0).
+    const { kindTop, kindBottom, kindLeft, kindRight } = this;
     for (let j = 1; j <= ny; j++) {
       for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
-        const uk = u[k] - 0.5 * (p[k + 1] - p[k - 1]);
-        const vk = v[k] - 0.5 * (p[k + w] - p[k - w]);
-        const s2 = uk * uk + vk * vk;
-        if (s2 > max2) {
-          const f = this.maxSpeed / Math.sqrt(s2);
-          u[k] = uk * f;
-          v[k] = vk * f;
-        } else {
-          u[k] = uk;
-          v[k] = vk;
-        }
+        if (i < nx) u[k] -= p[k + 1] - p[k];
+        if (j < ny) v[k] -= p[k + w] - p[k];
       }
     }
-    this.velocityBoundary();
+    for (let i = 1; i <= nx; i++) {
+      if (kindTop[i] === OUTLET) v[i] -= p[i + w];
+      if (kindBottom[i] === OUTLET) v[i + w * ny] += p[i + w * ny];
+    }
+    for (let j = 1; j <= ny; j++) {
+      if (kindLeft[j] === OUTLET) u[w * j] -= p[1 + w * j];
+      if (kindRight[j] === OUTLET) u[nx + w * j] += p[nx + w * j];
+    }
+
+    // Cap the speed so nothing can run away.
+    const max = this.maxSpeed;
+    for (let k = 0; k < u.length; k++) {
+      if (u[k] > max) u[k] = max; else if (u[k] < -max) u[k] = -max;
+      if (v[k] > max) v[k] = max; else if (v[k] < -max) v[k] = -max;
+    }
+    this.tangentialBoundary();
   }
 
-  // Semi-Lagrangian advection of d0 into d along (uu, vv).
-  advect(d, d0, uu, vv, dt) {
-    const { nx, ny, w } = this;
+  // Semi-Lagrangian advection of the velocity: each inner face looks back
+  // along the flow and takes the velocity it finds there.
+  advectVelocity(dt) {
+    const { nx, ny, w, u, v, u0, v0 } = this;
+    u0.set(u);
+    v0.set(v);
     const xmax = nx + 0.5, ymax = ny + 0.5;
+    const clampX = (x) => (x < 0.5 ? 0.5 : x > xmax ? xmax : x);
+    const clampY = (y) => (y < 0.5 ? 0.5 : y > ymax ? ymax : y);
     for (let j = 1; j <= ny; j++) {
       for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
-        let x = i - dt * uu[k], y = j - dt * vv[k];
-        if (x < 0.5) x = 0.5; else if (x > xmax) x = xmax;
-        if (y < 0.5) y = 0.5; else if (y > ymax) y = ymax;
-        const i0 = x | 0, j0 = y | 0;
-        const s1 = x - i0, t1 = y - j0, s0 = 1 - s1, t0 = 1 - t1;
-        const k0 = i0 + w * j0;
-        d[k] = s0 * (t0 * d0[k0] + t1 * d0[k0 + w]) + s1 * (t0 * d0[k0 + 1] + t1 * d0[k0 + 1 + w]);
+        if (i < nx) {
+          const vv = 0.25 * (v0[k] + v0[k + 1] + v0[k - w] + v0[k + 1 - w]);
+          u[k] = this.sampleU(u0, clampX(i + 0.5 - dt * u0[k]), clampY(j - dt * vv));
+        }
+        if (j < ny) {
+          const uu = 0.25 * (u0[k] + u0[k - 1] + u0[k + w] + u0[k - 1 + w]);
+          v[k] = this.sampleV(v0, clampX(i - dt * uu), clampY(j + 0.5 - dt * v0[k]));
+        }
       }
     }
   }
@@ -436,30 +520,222 @@ class FluidSim {
     this.applyWindShear(dt);
     this.velocityBoundary();
     this.diffuseVelocity(dt);
-
-    this.u0.set(this.u);
-    this.v0.set(this.v);
-    this.advect(this.u, this.u0, this.u0, this.v0, dt);
-    this.advect(this.v, this.v0, this.u0, this.v0, dt);
+    this.advectVelocity(dt);
     this.velocityBoundary();
     this.project();
-
     this.updateDensity(dt);
   }
 
   // Continuity: carry rho with the flow, then compress or expand it by the
   // divergence of the velocity.
   updateDensity(dt) {
-    const { nx, ny, w, u, v, rho } = this;
-    this.rho0.set(rho);
-    this.advect(rho, this.rho0, u, v, dt);
+    const { nx, ny, w, u, v, rho, rho0 } = this;
+    rho0.set(rho);
+    const xmax = nx + 0.5, ymax = ny + 0.5;
     for (let j = 1; j <= ny; j++) {
       for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
-        const d = 0.5 * (u[k + 1] - u[k - 1] + v[k + w] - v[k - w]);
-        const r = rho[k] * Math.exp(-d * dt);
+        let x = i - dt * 0.5 * (u[k] + u[k - 1]), y = j - dt * 0.5 * (v[k] + v[k - w]);
+        if (x < 0.5) x = 0.5; else if (x > xmax) x = xmax;
+        if (y < 0.5) y = 0.5; else if (y > ymax) y = ymax;
+        const d = u[k] - u[k - 1] + v[k] - v[k - w];
+        const r = this.sampleC(rho0, x, y) * Math.exp(-d * dt);
         rho[k] = r < 0.2 ? 0.2 : r > 5 ? 5 : r;
       }
     }
     this.scalarBoundary(rho, 1);
+  }
+}
+
+/*
+ * The pressure Poisson equation, A p = b, solved by conjugate gradients
+ * with a multigrid V-cycle as the preconditioner (McAdams et al., 2010).
+ *
+ * A is the five-point Laplacian with the sign flipped so it is positive:
+ * (A p)_k = diag_k p_k - sum over neighbours of p. Faces between two cells
+ * couple them; an outlet edge is a neighbour fixed at 0 (so it only adds to
+ * the diagonal); a wall or inlet edge has no term at all. Each coarser level
+ * is the Galerkin product P^T A P, with P copying a coarse cell into the 2x2
+ * fine cells it covers, so the preconditioner is symmetric and CG stays
+ * valid however the edges are mixed. A sealed box has no outlets, A is then
+ * singular (any constant can be added to p), and the solve works in the
+ * space of zero-mean pressures.
+ */
+class PressureSolver {
+  constructor(nx, ny) {
+    this.levels = [];
+    for (;;) {
+      const w = nx + 2, n = w * (ny + 2);
+      const f = () => new Float32Array(n);
+      this.levels.push({ nx, ny, w, diag: f(), cE: f(), cS: f(), x: f(), b: f(), r: f() });
+      if (nx <= 4 || ny <= 4 || this.levels.length >= 12) break;
+      nx = (nx + 1) >> 1;
+      ny = (ny + 1) >> 1;
+    }
+    const n = this.levels[0].x.length;
+    this.r = new Float32Array(n); // CG residual, direction, A * direction
+    this.s = new Float32Array(n);
+    this.q = new Float32Array(n);
+    this.singular = false;
+    this.key = '';
+    this.tolerance = 5e-3; // largest divergence error left, cells per second
+    this.maxIters = 16;   // a frame where the edges change can need more; the next one finishes
+    this.sweeps = 1;      // smoothing passes each way per level
+    this.iters = 0;       // what the last solve took
+    this.residual = 0;
+  }
+
+  // Rebuilds the operator on every level when the edges change.
+  setBoundary(kindTop, kindBottom, kindLeft, kindRight) {
+    const key = String.fromCharCode(...kindTop, ...kindBottom, ...kindLeft, ...kindRight);
+    if (key === this.key) return;
+    this.key = key;
+    const L = this.levels[0], { nx, ny, w, diag, cE, cS } = L;
+    diag.fill(0); cE.fill(0); cS.fill(0);
+    let dirichlet = false;
+    for (let j = 1; j <= ny; j++) {
+      for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
+        let d = 4;
+        if (i === 1 && kindLeft[j] !== OUTLET) d--;
+        if (i === nx && kindRight[j] !== OUTLET) d--;
+        if (j === 1 && kindTop[i] !== OUTLET) d--;
+        if (j === ny && kindBottom[i] !== OUTLET) d--;
+        diag[k] = d;
+        if (i < nx) cE[k] = 1;
+        if (j < ny) cS[k] = 1;
+      }
+    }
+    for (const kind of [kindTop, kindBottom, kindLeft, kindRight]) {
+      if (kind.some((k, i) => i > 0 && i < kind.length - 1 && k === OUTLET)) dirichlet = true;
+    }
+    this.singular = !dirichlet;
+
+    // Galerkin coarsening. A coupling between two fine cells in the same
+    // coarse cell cancels out of the coarse diagonal (twice, once for each
+    // side); one between different coarse cells adds to their coupling.
+    for (let l = 1; l < this.levels.length; l++) {
+      const F = this.levels[l - 1], C = this.levels[l];
+      C.diag.fill(0); C.cE.fill(0); C.cS.fill(0);
+      for (let j = 1; j <= F.ny; j++) {
+        const J = (j + 1) >> 1;
+        for (let i = 1, k = 1 + F.w * j; i <= F.nx; i++, k++) {
+          const K = ((i + 1) >> 1) + C.w * J;
+          C.diag[K] += F.diag[k];
+          if (F.cE[k]) { if (i & 1) C.diag[K] -= 2 * F.cE[k]; else C.cE[K] += F.cE[k]; }
+          if (F.cS[k]) { if (j & 1) C.diag[K] -= 2 * F.cS[k]; else C.cS[K] += F.cS[k]; }
+        }
+      }
+    }
+  }
+
+  // out = A x on level L.
+  apply(L, x, out) {
+    const { nx, ny, w, diag, cE, cS } = L;
+    for (let j = 1; j <= ny; j++) {
+      for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) {
+        out[k] = diag[k] * x[k] - cE[k] * x[k + 1] - cE[k - 1] * x[k - 1] - cS[k] * x[k + w] - cS[k - w] * x[k - w];
+      }
+    }
+  }
+
+  // One Gauss-Seidel pass over the cells of one colour of a checkerboard.
+  relax(L, colour) {
+    const { nx, ny, w, diag, cE, cS, x, b } = L;
+    for (let j = 1; j <= ny; j++) {
+      for (let i = 1 + ((j + colour + 1) & 1), k = i + w * j; i <= nx; i += 2, k += 2) {
+        const d = diag[k];
+        if (d > 0) x[k] = (b[k] + cE[k] * x[k + 1] + cE[k - 1] * x[k - 1] + cS[k] * x[k + w] + cS[k - w] * x[k - w]) / d;
+      }
+    }
+  }
+
+  // Approximately solves level l from its b, starting at x = 0. Smoothing
+  // is red-black going down and black-red coming up, which keeps the
+  // whole cycle symmetric.
+  vcycle(l) {
+    const L = this.levels[l];
+    L.x.fill(0);
+    if (l === this.levels.length - 1) {
+      for (let s = 0; s < 20; s++) { this.relax(L, 0); this.relax(L, 1); this.relax(L, 1); this.relax(L, 0); }
+      return;
+    }
+    for (let s = 0; s < this.sweeps; s++) { this.relax(L, 0); this.relax(L, 1); }
+    this.apply(L, L.x, L.r);
+    const C = this.levels[l + 1];
+    C.b.fill(0);
+    for (let j = 1; j <= L.ny; j++) {
+      const J = (j + 1) >> 1;
+      for (let i = 1, k = 1 + L.w * j; i <= L.nx; i++, k++) {
+        C.b[((i + 1) >> 1) + C.w * J] += L.b[k] - L.r[k];
+      }
+    }
+    this.vcycle(l + 1);
+    for (let j = 1; j <= L.ny; j++) {
+      const J = (j + 1) >> 1;
+      for (let i = 1, k = 1 + L.w * j; i <= L.nx; i++, k++) L.x[k] += C.x[((i + 1) >> 1) + C.w * J];
+    }
+    for (let s = 0; s < this.sweeps; s++) { this.relax(L, 1); this.relax(L, 0); }
+  }
+
+  // z = M^-1 r: one V-cycle on the residual.
+  precondition(r) {
+    const L = this.levels[0];
+    L.b.set(r);
+    this.vcycle(0);
+    if (this.singular) this.removeMean(L.x);
+    return L.x;
+  }
+
+  removeMean(x) {
+    const { nx, ny, w } = this.levels[0];
+    let sum = 0;
+    for (let j = 1; j <= ny; j++) for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) sum += x[k];
+    const m = sum / (nx * ny);
+    for (let j = 1; j <= ny; j++) for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) x[k] -= m;
+  }
+
+  dot(a, b) {
+    const { nx, ny, w } = this.levels[0];
+    let sum = 0;
+    for (let j = 1; j <= ny; j++) for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) sum += a[k] * b[k];
+    return sum;
+  }
+
+  maxAbs(a) {
+    const { nx, ny, w } = this.levels[0];
+    let m = 0;
+    for (let j = 1; j <= ny; j++) {
+      for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) { const x = a[k] < 0 ? -a[k] : a[k]; if (x > m) m = x; }
+    }
+    return m;
+  }
+
+  // Solves A p = b in place, starting from the p passed in.
+  solve(p, b) {
+    const L = this.levels[0], { r, s, q } = this;
+    if (this.singular) this.removeMean(p);
+    this.apply(L, p, r);
+    for (let k = 0; k < r.length; k++) r[k] = b[k] - r[k];
+    if (this.singular) this.removeMean(r);
+    let res = this.maxAbs(r), it = 0;
+    if (res > this.tolerance) {
+      s.set(this.precondition(r));
+      let rz = this.dot(r, s);
+      for (; it < this.maxIters && res > this.tolerance; it++) {
+        this.apply(L, s, q);
+        const sq = this.dot(s, q);
+        if (!(sq > 0)) break;
+        const alpha = rz / sq;
+        for (let k = 0; k < p.length; k++) { p[k] += alpha * s[k]; r[k] -= alpha * q[k]; }
+        res = this.maxAbs(r);
+        if (res <= this.tolerance) { it++; break; }
+        const z = this.precondition(r);
+        const rzNew = this.dot(r, z);
+        const beta = rzNew / rz;
+        rz = rzNew;
+        for (let k = 0; k < s.length; k++) s[k] = z[k] + beta * s[k];
+      }
+    }
+    this.iters = it;
+    this.residual = res;
   }
 }
