@@ -25,10 +25,8 @@
   const params = {
     visc: 0,
     vorticity: 1,
-    buoyancy: 12,
-    cooling: 0.35,
     stir: 0.5,
-    heat: 1,
+    fan: 150,
     pressure: 2.5,
     radius: 50,
     windSpeed: 0,
@@ -51,7 +49,8 @@
   let P = new Float32Array(0);
   const room = (n) => new Float32Array(Math.ceil(n * 1.5) * 4);
 
-  const zones = []; // { type, x, y, r } in CSS pixels
+  const zones = []; // { type, x, y, r, angle } in CSS pixels; angle for fans
+  let fanAngle = 0; // a new fan points the way the last one was aimed
   const windows = []; // { side, a, b }, see the windows section
   let hoverWindow = null;
   const controlRefs = {};
@@ -409,8 +408,8 @@
   // ------------------------------------------------------------- simulation
 
   function applyZones(dt) {
-    const gridZones = zones.map((z) => ({ type: z.type, x: z.x / cs + 0.5, y: z.y / cs + 0.5, r: z.r / cs }));
-    sim.applyZones(gridZones, params.heat, params.pressure, dt);
+    const gridZones = zones.map((z) => ({ type: z.type, x: z.x / cs + 0.5, y: z.y / cs + 0.5, r: z.r / cs, angle: z.angle }));
+    sim.applyZones(gridZones, params.fan / cs, params.pressure, dt);
   }
 
   function applyStir(dt) {
@@ -567,20 +566,21 @@
           }
         }
       } else {
-        // Chevrons drifting up (heat) or down (cold).
-        const up = z.type === 'heat' ? -1 : 1;
-        const c = Math.min(4, z.r * 0.12);
-        for (let m = -1; m <= 1; m++) {
-          const ph = (t * 0.45 + (m + 1) * 0.33) % 1;
-          const x = z.x + m * z.r * 0.35;
-          const y = z.y - up * z.r * 0.45 * (1 - 2 * ph);
+        // Chevrons streaming through the fan the way it blows.
+        const dx = Math.cos(z.angle), dy = Math.sin(z.angle);
+        const c = Math.min(7, z.r * 0.2);
+        for (let m = 0; m < 3; m++) {
+          const ph = (t * 0.6 + m / 3) % 1;
+          const s = z.r * 0.6 * (2 * ph - 1);
+          const x = z.x + dx * s, y = z.y + dy * s;
           octx.globalAlpha = Math.sin(ph * Math.PI);
           octx.beginPath();
-          octx.moveTo(x - c, y - up * c);
+          octx.moveTo(x - dx * c + dy * c, y - dy * c - dx * c);
           octx.lineTo(x, y);
-          octx.lineTo(x + c, y - up * c);
+          octx.lineTo(x - dx * c - dy * c, y - dy * c + dx * c);
           octx.stroke();
         }
+        octx.globalAlpha = 1;
       }
       drawLabel(z.type, z.x + z.r * 0.707 + 4, z.y - z.r * 0.707 - 10);
     }
@@ -588,7 +588,7 @@
 
   function drawCursor() {
     if (!hover) return;
-    for (const p of pointers.values()) if (p.mode === 'move' || p.mode === 'window') return;
+    for (const p of pointers.values()) if (p.mode === 'move' || p.mode === 'aim' || p.mode === 'window') return;
     if (state.tool === 'window') {
       // Preview where a click would open a window.
       if (hoverWindow) return;
@@ -634,8 +634,6 @@
 
     sim.visc = viscOf(params.visc);
     sim.vorticity = params.vorticity;
-    sim.buoyancy = params.buoyancy;
-    sim.cooling = params.cooling;
     sim.walls = state.walls;
     applyWindows();
     if (!state.paused) updateWind(now / 1000);
@@ -684,7 +682,7 @@
     if ((hoverZone || hoverWindow) && state.tool === 'erase') c = 'pointer';
     else if (hoverWindow && state.tool === 'window') c = 'pointer';
     else if (hoverZone && state.tool !== 'stir' && state.tool !== 'window') c = 'grab';
-    for (const p of pointers.values()) if (p.mode === 'move') c = 'grabbing';
+    for (const p of pointers.values()) if (p.mode === 'move' || p.mode === 'aim') c = 'grabbing';
     view.style.cursor = c;
   }
 
@@ -717,9 +715,11 @@
         windows.push(p.win);
       }
     } else if (state.tool !== 'stir') {
-      p.mode = 'move';
-      p.zone = z || { type: state.tool, x, y, r: params.radius };
+      // A new fan stays put and the drag aims it, as does shift-dragging an
+      // existing one. Anything else drags the zone around.
+      p.zone = z || { type: state.tool, x, y, r: params.radius, angle: fanAngle };
       if (!z) zones.push(p.zone);
+      p.mode = p.zone.type === 'fan' && (!z || e.shiftKey) ? 'aim' : 'move';
       p.ox = p.zone.x - x;
       p.oy = p.zone.y - y;
     }
@@ -734,6 +734,9 @@
     if (p) {
       p.x = x; p.y = y;
       if (p.mode === 'move') { p.zone.x = x + p.ox; p.zone.y = y + p.oy; }
+      if (p.mode === 'aim' && Math.hypot(x - p.zone.x, y - p.zone.y) > 8) {
+        p.zone.angle = fanAngle = Math.atan2(y - p.zone.y, x - p.zone.x);
+      }
       if (p.mode === 'erase') {
         const z = hit(x, y), wd = hitWindow(x, y);
         if (z) removeZone(z);
@@ -749,7 +752,7 @@
         }
       }
     }
-    hoverZone = p && p.mode === 'move' ? p.zone : hit(x, y);
+    hoverZone = p && (p.mode === 'move' || p.mode === 'aim') ? p.zone : hit(x, y);
     hoverWindow = p && p.mode === 'window' ? p.win : hoverZone ? null : hitWindow(x, y);
     updateCursor();
   });
@@ -778,15 +781,13 @@
 
   const TOOLS = [
     ['stir', 'stir'], ['low', 'low p'], ['high', 'high p'],
-    ['heat', 'heat'], ['cold', 'cold'], ['window', 'window'],
-    ['erase', 'erase'],
+    ['fan', 'fan'], ['window', 'window'], ['erase', 'erase'],
   ];
   const HINTS = {
     stir: 'drag to push the fluid around.',
     low: 'click to place a low-pressure zone. it draws fluid in and compresses it until the pressure evens out.',
     high: 'click to place a high-pressure zone. fluid expands outwards until the pressure evens out.',
-    heat: 'click to place a heat source. warm fluid rises.',
-    cold: 'click to place a cold source. cool fluid sinks.',
+    fan: 'click to place a fan, dragging to aim it. it keeps pushing fluid through itself, pulling more in behind. shift-drag a fan to re-aim it.',
     window: 'click near a wall to open a window, or drag along it to size one. click a window to close it. turns walls on.',
     erase: 'click or drag across zones and windows to remove them.',
   };
@@ -820,11 +821,9 @@
     { key: 'visc', label: 'viscosity', min: 0, max: 100, step: 1,
       fmt: (s) => { const v = viscOf(s); return v === 0 ? 'inviscid' : `${num(v)} · ${viscWord(v)}`; } },
     { key: 'vorticity', label: 'swirl', min: 0, max: 5, step: 0.1, fmt: (s) => s.toFixed(1) },
-    { key: 'buoyancy', label: 'buoyancy', min: 0, max: 60, step: 1, fmt: String },
-    { key: 'cooling', label: 'cooling', min: 0, max: 2, step: 0.01, fmt: (s) => s.toFixed(2) },
     { group: 'forces' },
     { key: 'stir', label: 'stir strength', min: 0.05, max: 1, step: 0.05, fmt: (s) => s.toFixed(2) },
-    { key: 'heat', label: 'temperature', min: 0.1, max: 2, step: 0.05, fmt: (s) => s.toFixed(2) },
+    { key: 'fan', label: 'fan speed', min: 10, max: 400, step: 10, fmt: (s) => `${s} px/s` },
     { key: 'pressure', label: 'pressure', min: 1, max: 4, step: 0.1,
       fmt: (s) => `${s.toFixed(1)}× density` },
     { key: 'radius', label: 'brush radius', min: 10, max: 200, step: 1, fmt: (s) => `${s}px` },

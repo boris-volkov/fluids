@@ -6,8 +6,9 @@
  * velocities are in cells per second.
  *
  * Extras on top of the classic solver:
- *  - a temperature field that is advected with the flow and pushes warm
- *    fluid upwards (buoyancy) and cold fluid downwards;
+ *  - fans: a disc of fluid driven towards a set velocity, the way a fan
+ *    keeps pushing air through itself. Everything is seen from above, so
+ *    there is no gravity and nothing rises;
  *  - vorticity confinement, to keep small swirls from being smeared away;
  *  - weak compressibility: a density field rho (1 = at rest) is carried
  *    with the flow and updated from the velocity divergence. Wherever the
@@ -37,7 +38,6 @@ class FluidSim {
     const field = () => new Float32Array(n);
     this.u = field(); this.v = field();
     this.u0 = field(); this.v0 = field();
-    this.T = field(); this.T0 = field();
     this.p = field(); this.div = field(); this.curl = field();
     this.rho = field(); this.rho0 = field();
     this.rho.fill(1);
@@ -67,8 +67,6 @@ class FluidSim {
     this.stiffness = 1.5; // how quickly squeezed / stretched fluid relaxes, 1/s
     this.visc = 0;
     this.vorticity = 1;
-    this.buoyancy = 12;
-    this.cooling = 0.35;
     this.maxSpeed = 50;
     this.pressureIters = 24;
     this.viscIters = 12;
@@ -76,7 +74,7 @@ class FluidSim {
   }
 
   reset() {
-    for (const f of [this.u, this.v, this.u0, this.v0, this.T, this.T0, this.p, this.div, this.curl]) f.fill(0);
+    for (const f of [this.u, this.v, this.u0, this.v0, this.p, this.div, this.curl]) f.fill(0);
     this.rho.fill(1);
   }
 
@@ -256,11 +254,12 @@ class FluidSim {
 
   // -------------------------------------------------------------- user input
 
-  // zones: [{ type: 'low' | 'high' | 'heat' | 'cold', x, y, r }] in grid units.
-  // squeeze is how many times denser (low) or thinner (high) the fluid in a
-  // pressure zone settles at.
-  applyZones(zones, temperature, squeeze, dt) {
-    const { nx, ny, w, T, source } = this;
+  // zones: [{ type: 'low' | 'high' | 'fan', x, y, r, angle }] in grid units,
+  // angle (fans only) in radians from +x towards +y. squeeze is how many
+  // times denser (low) or thinner (high) the fluid in a pressure zone
+  // settles at; fanSpeed is in cells per second.
+  applyZones(zones, fanSpeed, squeeze, dt) {
+    const { nx, ny, w, source } = this;
     source.fill(0);
     const rate = Math.min(1, 6 * dt);
     // At rest, stiffness * (rho - 1) + source = 0 inside the zone.
@@ -268,22 +267,19 @@ class FluidSim {
     const qHigh = -this.stiffness * (1 / squeeze - 1);
     for (const z of zones) {
       const r = Math.max(z.r, 0.75), r2 = r * r;
+      if (z.type === 'fan') {
+        const speed = Math.min(fanSpeed, this.maxSpeed);
+        this.splatVelocity(z.x, z.y, r, Math.cos(z.angle) * speed, Math.sin(z.angle) * speed, rate);
+        continue;
+      }
       const i0 = Math.max(1, Math.floor(z.x - r)), i1 = Math.min(nx, Math.ceil(z.x + r));
       const j0 = Math.max(1, Math.floor(z.y - r)), j1 = Math.min(ny, Math.ceil(z.y + r));
-      const pressureZone = z.type === 'low' || z.type === 'high';
       const zq = z.type === 'low' ? qLow : qHigh;
-      const target = z.type === 'heat' ? temperature : -temperature;
       for (let j = j0; j <= j1; j++) {
         for (let i = i0; i <= i1; i++) {
           const dx = i - z.x, dy = j - z.y, d2 = dx * dx + dy * dy;
           if (d2 > r2) continue;
-          const k = i + w * j;
-          if (pressureZone) {
-            source[k] += zq;
-          } else {
-            const f = Math.min(1, rate * 2 * (1 - d2 / r2));
-            T[k] += (target - T[k]) * f;
-          }
+          source[i + w * j] += zq;
         }
       }
     }
@@ -310,15 +306,7 @@ class FluidSim {
   // ------------------------------------------------------------------ solver
 
   addForces(dt) {
-    const { nx, ny, w, u, v, T, curl } = this;
-
-    // Buoyancy. Screen y points down, so "up" is -v.
-    const b = this.buoyancy * dt;
-    if (b > 0) {
-      for (let j = 1; j <= ny; j++) {
-        for (let i = 1, k = 1 + w * j; i <= nx; i++, k++) v[k] -= b * T[k];
-      }
-    }
+    const { nx, ny, w, u, v, curl } = this;
 
     // Vorticity confinement: push along N x omega, where N points towards
     // stronger swirl. Only swirl above a small threshold is reinforced, so
@@ -455,13 +443,6 @@ class FluidSim {
     this.advect(this.v, this.v0, this.u0, this.v0, dt);
     this.velocityBoundary();
     this.project();
-
-    this.T0.set(this.T);
-    this.advect(this.T, this.T0, this.u, this.v, dt);
-    const decay = Math.exp(-this.cooling * dt);
-    const T = this.T;
-    for (let k = 0; k < T.length; k++) T[k] *= decay;
-    this.scalarBoundary(T);
 
     this.updateDensity(dt);
   }
